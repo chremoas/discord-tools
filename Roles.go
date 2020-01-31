@@ -4,12 +4,12 @@ import (
 	"errors"
 	"fmt"
 	discord "github.com/chremoas/discord-gateway/proto"
+	"github.com/chremoas/role-srv/handler"
 	rolesrv "github.com/chremoas/role-srv/proto"
 	common "github.com/chremoas/services-common/command"
 	"github.com/chremoas/services-common/config"
 	redis "github.com/chremoas/services-common/redis"
 	"github.com/chremoas/services-common/sets"
-	"github.com/fatih/structs"
 	"github.com/micro/go-micro"
 	"github.com/micro/go-micro/client"
 	"github.com/spf13/viper"
@@ -37,363 +37,92 @@ type syncData struct {
 	SendMessage bool
 }
 
-var syncControl chan syncData
-var clients clientList
-var ignoredRoles []string
-var roleKeys = []string{"Name", "Color", "Hoist", "Position", "Permissions", "Managed", "Mentionable", "Sync"}
-var roleTypes = []string{"internal", "discord"}
+var (
+	syncControl  chan syncData
+	clients      clientList
+	ignoredRoles []string
+	log          *zap.Logger
+	service      micro.Service
+)
 
-//func NewRolesHandler(config *config.Configuration, service micro.Service, log *zap.Logger) rolesrv.RolesHandler {
-//	c := service.Client()
-//
-//	clients = clientList{
-//		discord: discord.NewDiscordGatewayService(config.LookupService("gateway", "discord"), c),
-//	}
-//
-//	ignoredRoles = viper.GetStringSlice("bot.ignoredRoles")
-//
-//	redisClient := redis.Init(config.LookupService("srv", "perms"))
-//
-//	_, err := redisClient.Client.Ping().Result()
-//	if err != nil {
-//		panic(err)
-//	}
-//
-//	Let's create the role_admins and sig_admins stuff if it doesn't exist yet
-	//roleAdmin := redisClient.KeyName("description:role_admins")
-	//exists, err := redisClient.Client.Exists(roleAdmin).Result()
-	//if err != nil {
-	//	log.Error(err.Error())
-	//} else {
-	//	if exists == 0 {
-	//		log.Info("role_admins doesn't exist. Creating it.")
-	//		_, err = redisClient.Client.Set(roleAdmin, "Role Admins", 0).Result()
-	//		if err != nil {
-	//			log.Error(err.Error())
-	//		}
-	//	}
-	//}
-	//
-	//sigAdmin := redisClient.KeyName("description:sig_admins")
-	//exists, err = redisClient.Client.Exists(sigAdmin).Result()
-	//if err != nil {
-	//	log.Error(err.Error())
-	//} else {
-	//	if exists == 0 {
-	//		log.Info("sig_admins doesn't exist. Creating it.")
-	//		_, err = redisClient.Client.Set(sigAdmin, "SIG Admins", 0).Result()
-	//		if err != nil {
-	//			log.Error(err.Error())
-	//		}
-	//	}
-	//}
-	//
-	//rh := &rolesHandler{Redis: redisClient, Logger: log}
-	//
-	//Check and update Redis schema as needed
-	//rh.updateSchema()
-	//
-	//Start sync thread
-	//syncControl = make(chan syncData, 30)
-	//go rh.syncThread()
-	//
-	//return rh
-//}
+func main() {
+	var err error
 
-//func (h *rolesHandler) updateSchema() {
-//	sugar := h.Logger.Sugar()
-//
-//	// Update Roles hash
-//	roles, err := h.getRoles()
-//
-//	if err != nil {
-//		sugar.Errorf("Something went wrong getting the Roles: %s", err)
-//		return
-//	}
-//
-//	for role := range roles {
-//		roleName := h.Redis.KeyName(fmt.Sprintf("role:%s", roles[role]))
-//		roleInfo, err := h.Redis.Client.HGetAll(roleName).Result()
-//		if err != nil {
-//			sugar.Errorf("Something went wrong getting the hash from Redis: %s", err)
-//			return
-//		}
-//
-//		if roleInfo["Sync"] == "" {
-//			sugar.Infof("Updating role (%s) with default Sync value", roles[role])
-//			h.Redis.Client.HSet(roleName, "Sync", "1")
-//		}
-//	}
-//}
+	// I'm not sure what I'm doing yet but I know this needs to be handled somehow
+	log, err = zap.NewProduction()
+	if err != nil {
+		panic(err)
+	}
+	defer log.Sync()
+	log.Info("Initialized logger")
 
-//func (h *rolesHandler) GetRoleKeys(ctx context.Context, request *rolesrv.NilMessage, response *rolesrv.StringList) error {
-//	response.Value = roleKeys
-//	return nil
-//}
-//
-//func (h *rolesHandler) GetRoleTypes(ctx context.Context, request *rolesrv.NilMessage, response *rolesrv.StringList) error {
-//	response.Value = roleTypes
-//	return nil
-//}
+	service = config.NewService("0.0.1", "tools", "discord", initialize)
+	c := service.Client()
+	clients = clientList{
+		discord: discord.NewDiscordGatewayService(config.LookupService("gateway", "discord"), c),
+	}
+	ignoredRoles = viper.GetStringSlice("bot.ignoredRoles")
 
-//func (h *rolesHandler) AddRole(ctx context.Context, request *rolesrv.Role, response *rolesrv.NilMessage) error {
-//	roleName := h.Redis.KeyName(fmt.Sprintf("role:%s", request.ShortName))
-//	filterA := h.Redis.KeyName(fmt.Sprintf("filter_description:%s", request.FilterA))
-//	filterB := h.Redis.KeyName(fmt.Sprintf("filter_description:%s", request.FilterB))
-//
-//	// Type, Name and the filters are required so let's check for those
-//	if len(request.Type) == 0 {
-//		return errors.New("type is required")
-//	}
-//
-//	if len(request.ShortName) == 0 {
-//		return errors.New("ShortName is required")
-//	}
-//
-//	if len(request.Name) == 0 {
-//		return errors.New("Name is required")
-//	}
-//
-//	if len(request.FilterA) == 0 {
-//		return errors.New("FilterA is required")
-//	}
-//
-//	if len(request.FilterB) == 0 {
-//		return errors.New("FilterB is required")
-//	}
-//
-//	if !validListItem(request.Type, roleTypes) {
-//		return fmt.Errorf("`%s` isn't a valid Role Type", request.Type)
-//	}
-//
-//	exists, err := h.Redis.Client.Exists(roleName).Result()
-//
-//	if err != nil {
-//		return err
-//	}
-//
-//	if exists == 1 {
-//		return fmt.Errorf("Role `%s` already exists.", request.Name)
-//	}
-//
-//	// Check if filter A exists
-//	exists, err = h.Redis.Client.Exists(filterA).Result()
-//
-//	if err != nil {
-//		return err
-//	}
-//
-//	if exists == 0 && request.FilterA != "wildcard" {
-//		return fmt.Errorf("FilterA `%s` doesn't exists.", request.FilterA)
-//	}
-//
-//	// Check if filter B exists
-//	exists, err = h.Redis.Client.Exists(filterB).Result()
-//
-//	if err != nil {
-//		return err
-//	}
-//
-//	if exists == 0 && request.FilterB != "wildcard" {
-//		return fmt.Errorf("FilterB `%s` doesn't exists.", request.FilterB)
-//	}
-//
-//	_, err = h.Redis.Client.HMSet(roleName, structs.Map(request)).Result()
-//
-//	if err != nil {
-//		return err
-//	}
-//
-//	response = &rolesrv.NilMessage{}
-//
-//	return nil
-//}
-//
-//func (h *rolesHandler) UpdateRole(ctx context.Context, request *rolesrv.UpdateInfo, response *rolesrv.NilMessage) error {
-//	// Does this actually work? -brian
-//	roleName := h.Redis.KeyName(fmt.Sprintf("role:%s", request.Name))
-//
-//	exists, err := h.Redis.Client.Exists(roleName).Result()
-//
-//	if err != nil {
-//		return err
-//	}
-//
-//	if exists == 0 {
-//		return fmt.Errorf("Role `%s` doesn't exists.", request.Name)
-//	}
-//
-//	if !validListItem(request.Key, roleKeys) {
-//		return fmt.Errorf("`%s` isn't a valid Role Key.", request.Key)
-//	}
-//
-//	h.Redis.Client.HSet(roleName, request.Key, request.Value)
-//
-//	return nil
-//}
-//
-//func validListItem(a string, list []string) bool {
-//	for _, b := range list {
-//		if b == a {
-//			return true
-//		}
-//	}
-//	return false
-//}
-//
-//func (h *rolesHandler) RemoveRole(ctx context.Context, request *rolesrv.Role, response *rolesrv.NilMessage) error {
-//	roleName := h.Redis.KeyName(fmt.Sprintf("role:%s", request.ShortName))
-//
-//	exists, err := h.Redis.Client.Exists(roleName).Result()
-//
-//	if err != nil {
-//		return err
-//	}
-//
-//	if exists == 0 {
-//		return fmt.Errorf("Role `%s` doesn't exists.", request.ShortName)
-//	}
-//
-//	_, err = h.Redis.Client.Del(roleName).Result()
-//
-//	if err != nil {
-//		return err
-//	}
-//
-//	response = &rolesrv.NilMessage{}
-//	return nil
-//}
-//
-//func (h *rolesHandler) GetRoles(ctx context.Context, request *rolesrv.NilMessage, response *rolesrv.GetRolesResponse) error {
-//	var sigValue, joinableValue, syncValue bool
-//	roles, err := h.getRoles()
-//
-//	if err != nil {
-//		return err
-//	}
-//
-//	for role := range roles {
-//		roleInfo, err := h.Redis.Client.HGetAll(h.Redis.KeyName(fmt.Sprintf("role:%s", roles[role]))).Result()
-//		if err != nil {
-//			return err
-//		}
-//
-//		if roleInfo["Sig"] == "0" {
-//			sigValue = false
-//		} else {
-//			sigValue = true
-//		}
-//
-//		if roleInfo["Joinable"] == "0" {
-//			joinableValue = false
-//		} else {
-//			joinableValue = true
-//		}
-//
-//		if roleInfo["Sync"] == "0" {
-//			syncValue = false
-//		} else {
-//			syncValue = true
-//		}
-//
-//		response.Roles = append(response.Roles, &rolesrv.Role{
-//			ShortName: roles[role],
-//			Name:      roleInfo["Name"],
-//			Sig:       sigValue,
-//			Joinable:  joinableValue,
-//			Sync:      syncValue,
-//		})
-//	}
-//
-//	return nil
-//}
-//
-//func (h *rolesHandler) getRoles() ([]string, error) {
-//	var roleList []string
-//	roles, err := h.Redis.Client.Keys(h.Redis.KeyName("role:*")).Result()
-//
-//	if err != nil {
-//		return nil, err
-//	}
-//
-//	for role := range roles {
-//		roleName := strings.Split(roles[role], ":")
-//		roleList = append(roleList, roleName[len(roleName)-1])
-//	}
-//
-//	return roleList, nil
-//}
-//
-//func (h *rolesHandler) getRole(name string) (role map[string]string, err error) {
-//	roleName := h.Redis.KeyName(fmt.Sprintf("role:%s", name))
-//
-//	exists, err := h.Redis.Client.Exists(roleName).Result()
-//	if err != nil {
-//		return nil, err
-//	}
-//
-//	if exists == 0 {
-//		return nil, fmt.Errorf("role doesn't exist: %s", name)
-//	}
-//
-//	r, err := h.Redis.Client.HGetAll(roleName).Result()
-//	if err != nil {
-//		return nil, err
-//	}
-//
-//	return r, nil
-//}
-//
-//func (h *rolesHandler) mapRoleToProtobufRole(role map[string]string) *rolesrv.Role {
-//	color, _ := strconv.ParseInt(role["Color"], 10, 32)
-//	position, _ := strconv.ParseInt(role["Position"], 10, 32)
-//	permissions, _ := strconv.ParseInt(role["Permissions"], 10, 32)
-//	hoist, _ := strconv.ParseBool(role["Hoist"])
-//	managed, _ := strconv.ParseBool(role["Managed"])
-//	mentionable, _ := strconv.ParseBool(role["Mentionable"])
-//	sig, _ := strconv.ParseBool(role["Sig"])
-//	joinable, _ := strconv.ParseBool(role["Joinable"])
-//	sync, _ := strconv.ParseBool(role["Sync"])
-//
-//	return &rolesrv.Role{
-//		ShortName:   role["ShortName"],
-//		Type:        role["Type"],
-//		FilterA:     role["FilterA"],
-//		FilterB:     role["FilterB"],
-//		Name:        role["Name"],
-//		Color:       int32(color),
-//		Hoist:       hoist,
-//		Position:    int32(position),
-//		Permissions: int32(permissions),
-//		Managed:     managed,
-//		Mentionable: mentionable,
-//		Sig:         sig,
-//		Joinable:    joinable,
-//		Sync:        sync,
-//	}
-//}
-//
-//func (h *rolesHandler) GetRole(ctx context.Context, request *rolesrv.Role, response *rolesrv.Role) error {
-//	role, err := h.getRole(request.ShortName)
-//	if err != nil {
-//		return err
-//	}
-//
-//	*response = *h.mapRoleToProtobufRole(role)
-//	return nil
-//}
-//
-//func (h *rolesHandler) sendMessage(ctx context.Context, channelId, message string, sendMessage bool) {
-//	sugar := h.Logger.Sugar()
-//
-//	if sendMessage {
-//		_, err := clients.discord.SendMessage(ctx, &discord.SendMessageRequest{ChannelId: channelId, Message: message})
-//		if err != nil {
-//			msg := fmt.Sprintf("sendMessage: %s", err.Error())
-//			sugar.Error(msg)
-//		}
-//	}
-//}
+	redisClient := redis.Init(config.LookupService("srv", "perms"))
+	_, err = redisClient.Client.Ping().Result()
+	if err != nil {
+		panic(err)
+	}
+	rh := &rolesHandler{Redis: redisClient, Logger: log}
+}
+
+func initialize(config *config.Configuration) error {
+	rolesrv.RegisterRolesHandler(service.Server(), handler.NewRolesHandler(config, service, logger))
+	return nil
+}
+
+func (h *rolesHandler) getRoles() ([]string, error) {
+	var roleList []string
+	roles, err := h.Redis.Client.Keys(h.Redis.KeyName("role:*")).Result()
+
+	if err != nil {
+		return nil, err
+	}
+
+	for role := range roles {
+		roleName := strings.Split(roles[role], ":")
+		roleList = append(roleList, roleName[len(roleName)-1])
+	}
+
+	return roleList, nil
+}
+
+func (h *rolesHandler) getRole(name string) (role map[string]string, err error) {
+	roleName := h.Redis.KeyName(fmt.Sprintf("role:%s", name))
+
+	exists, err := h.Redis.Client.Exists(roleName).Result()
+	if err != nil {
+		return nil, err
+	}
+
+	if exists == 0 {
+		return nil, fmt.Errorf("role doesn't exist: %s", name)
+	}
+
+	r, err := h.Redis.Client.HGetAll(roleName).Result()
+	if err != nil {
+		return nil, err
+	}
+
+	return r, nil
+}
+
+func (h *rolesHandler) sendMessage(ctx context.Context, channelId, message string, sendMessage bool) {
+	sugar := h.Logger.Sugar()
+
+	if sendMessage {
+		_, err := clients.discord.SendMessage(ctx, &discord.SendMessageRequest{ChannelId: channelId, Message: message})
+		if err != nil {
+			msg := fmt.Sprintf("sendMessage: %s", err.Error())
+			sugar.Error(msg)
+		}
+	}
+}
 
 func (h *rolesHandler) syncMembers(channelId, userId string, sendMessage bool) error {
 	sugar := h.Logger.Sugar()
@@ -899,166 +628,13 @@ func (h *rolesHandler) AddFilter(ctx context.Context, request *rolesrv.Filter, r
 	return nil
 }
 
-//func (h *rolesHandler) RemoveFilter(ctx context.Context, request *rolesrv.Filter, response *rolesrv.NilMessage) error {
-//	filterName := h.Redis.KeyName(fmt.Sprintf("filter_description:%s", request.Name))
-//	filterMembers := h.Redis.KeyName(fmt.Sprintf("filter_members:%s", request.Name))
-//
-//	exists, err := h.Redis.Client.Exists(filterName).Result()
-//
-//	if err != nil {
-//		return err
-//	}
-//
-//	if exists == 0 {
-//		return fmt.Errorf("Filter `%s` doesn't exists.", request.Name)
-//	}
-//
-//	members, err := h.Redis.Client.SMembers(filterMembers).Result()
-//
-//	if len(members) > 0 {
-//		return fmt.Errorf("Filter `%s` not empty.", request.Name)
-//	}
-//
-//	_, err = h.Redis.Client.Del(filterName).Result()
-//
-//	if err != nil {
-//		return err
-//	}
-//
-//	response = &rolesrv.NilMessage{}
-//	return nil
-//}
+func (h *rolesHandler) sendDualMessage(msg, channelId string, sendMessage bool) {
+	ctx := context.Background()
+	sugar := h.Logger.Sugar()
 
-//func (h *rolesHandler) GetMembers(ctx context.Context, request *rolesrv.Filter, response *rolesrv.MemberList) error {
-//	var memberlist []string
-//	filterName := h.Redis.KeyName(fmt.Sprintf("filter_members:%s", request.Name))
-//
-//	filters, err := h.Redis.Client.SMembers(filterName).Result()
-//
-//	if err != nil {
-//		return err
-//	}
-//
-//	for filter := range filters {
-//		if len(filters[filter]) > 0 {
-//			memberlist = append(memberlist, filters[filter])
-//		}
-//	}
-//
-//	response.Members = memberlist
-//	return nil
-//}
-
-//func (h *rolesHandler) AddMembers(ctx context.Context, request *rolesrv.Members, response *rolesrv.NilMessage) error {
-//	filterName := h.Redis.KeyName(fmt.Sprintf("filter_members:%s", request.Filter))
-//	filterDesc := h.Redis.KeyName(fmt.Sprintf("filter_description:%s", request.Filter))
-//
-//	exists, err := h.Redis.Client.Exists(filterDesc).Result()
-//
-//	if err != nil {
-//		return err
-//	}
-//
-//	if exists == 0 {
-//		return fmt.Errorf("Filter `%s` doesn't exists.", request.Filter)
-//	}
-//
-//	for member := range request.Name {
-//		_, err = h.Redis.Client.SAdd(filterName, request.Name[member]).Result()
-//	}
-//
-//	if err != nil {
-//		return err
-//	}
-//
-//	response = &rolesrv.NilMessage{}
-//	return nil
-//}
-
-//func (h *rolesHandler) RemoveMembers(ctx context.Context, request *rolesrv.Members, response *rolesrv.NilMessage) error {
-//	filterName := h.Redis.KeyName(fmt.Sprintf("filter_members:%s", request.Filter))
-//	filterDesc := h.Redis.KeyName(fmt.Sprintf("filter_description:%s", request.Filter))
-//
-//	exists, err := h.Redis.Client.Exists(filterDesc).Result()
-//
-//	if err != nil {
-//		return err
-//	}
-//
-//	if exists == 0 {
-//		return fmt.Errorf("Filter `%s` doesn't exists.", request.Filter)
-//	}
-//
-//	for member := range request.Name {
-//		_, err = h.Redis.Client.SRem(filterName, request.Name[member]).Result()
-//	}
-//
-//	if err != nil {
-//		return err
-//	}
-//
-//	response = &rolesrv.NilMessage{}
-//	return nil
-//}
-
-//func (h *rolesHandler) GetDiscordUser(ctx context.Context, request *rolesrv.GetDiscordUserRequest, response *rolesrv.GetDiscordUserResponse) error {
-//	members, err := clients.discord.GetAllMembersAsSlice(ctx, &discord.GetAllMembersRequest{})
-//	if err != nil {
-//		return err
-//	}
-//
-//	for m := range members.Members {
-//		if request.UserId == members.Members[m].User.Id {
-//			response.Username = members.Members[m].User.Username
-//			response.Avatar = members.Members[m].User.Avatar
-//			response.Bot = members.Members[m].User.Bot
-//			response.Discriminator = members.Members[m].User.Discriminator
-//			response.Email = members.Members[m].User.Email
-//			response.MfaEnabled = members.Members[m].User.MFAEnabled
-//			response.Verified = members.Members[m].User.Verified
-//
-//			return nil
-//		}
-//	}
-//
-//	return errors.New("User not found")
-//}
-
-//func (h *rolesHandler) GetDiscordUserList(ctx context.Context, request *rolesrv.NilMessage, response *rolesrv.GetDiscordUserListResponse) error {
-//	members, err := clients.discord.GetAllMembersAsSlice(ctx, &discord.GetAllMembersRequest{})
-//	if err != nil {
-//		return err
-//	}
-//
-//	for m := range members.Members {
-//		response.Users = append(response.Users, &rolesrv.GetDiscordUserResponse{
-//			Nick:          members.Members[m].Nick,
-//			Id:            members.Members[m].User.Id,
-//			Username:      members.Members[m].User.Username,
-//			Avatar:        members.Members[m].User.Avatar,
-//			Bot:           members.Members[m].User.Bot,
-//			Discriminator: members.Members[m].User.Discriminator,
-//			Email:         members.Members[m].User.Email,
-//			MfaEnabled:    members.Members[m].User.MFAEnabled,
-//			Verified:      members.Members[m].User.Verified,
-//		})
-//	}
-//
-//	return nil
-//}
-
-//func (h *rolesHandler) SyncToChatService(ctx context.Context, request *rolesrv.SyncRequest, response *rolesrv.NilMessage) error {
-//	syncControl <- syncData{ChannelId: request.ChannelId, UserId: request.UserId, SendMessage: request.SendMessage}
-//	return nil
-//}
-
-//func (h *rolesHandler) sendDualMessage(msg, channelId string, sendMessage bool) {
-//	ctx := context.Background()
-//	sugar := h.Logger.Sugar()
-//
-//	sugar.Info(msg)
-//	h.sendMessage(ctx, channelId, common.SendSuccess(msg), sendMessage)
-//}
+	sugar.Info(msg)
+	h.sendMessage(ctx, channelId, common.SendSuccess(msg), sendMessage)
+}
 
 func (h *rolesHandler) syncThread() {
 	for {
@@ -1085,28 +661,3 @@ func (h *rolesHandler) syncThread() {
 		h.sendDualMessage(msg, request.ChannelId, request.SendMessage)
 	}
 }
-
-//func (h *rolesHandler) ListUserRoles(ctx context.Context, request *rolesrv.ListUserRolesRequest, response *rolesrv.ListUserRolesResponse) error {
-//	roles, err := h.getRoles()
-//	if err != nil {
-//		return err
-//	}
-//
-//	for role := range roles {
-//		r, err := h.getRoleMembership(roles[role])
-//		if err != nil {
-//			return err
-//		}
-//
-//		if r.Contains(request.UserId) {
-//			rInfo, err := h.getRole(roles[role])
-//			if err != nil {
-//				return err
-//			}
-//
-//			response.Roles = append(response.Roles, h.mapRoleToProtobufRole(rInfo))
-//		}
-//	}
-//
-//	return nil
-//}
